@@ -8,16 +8,14 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-
 type QueueMiddleware struct {
 	queueName  string
 	connection *amqp.Connection
 	publisher  *amqp.Channel
 
-	mutex     sync.Mutex
+	mutex  sync.Mutex
 	closed bool
 }
-
 
 func newQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
 	queue := &QueueMiddleware{
@@ -81,14 +79,29 @@ func (queue *QueueMiddleware) StopConsuming() error {
 	return nil
 }
 
-func (queue *QueueMiddleware) Send(m.Message) error {
+func (queue *QueueMiddleware) Send(message m.Message) error {
 	queue.mutex.Lock()
 	defer queue.mutex.Unlock()
 
-	if queue.closed {
+	if queue.closed || queue.connection.IsClosed() {
 		return m.ErrMessageMiddlewareDisconnected
 	}
-	return m.ErrMessageMiddlewareMessage
+
+	err := queue.publisher.Publish(
+		"",
+		queue.queueName,
+		false,
+		false,
+		amqp.Publishing{Body: []byte(message.Body)},
+	)
+	if err != nil {
+		if queue.connection.IsClosed() {
+			return m.ErrMessageMiddlewareDisconnected
+		}
+		return m.ErrMessageMiddlewareMessage
+	}
+
+	return nil
 }
 
 func (queue *QueueMiddleware) Close() error {
