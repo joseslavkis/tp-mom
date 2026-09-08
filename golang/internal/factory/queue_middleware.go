@@ -9,16 +9,22 @@ import (
 )
 
 type QueueMiddleware struct {
-	queueName        string
-	connection       *amqp.Connection
-	publisher        *amqp.Channel
-	consumer         *amqp.Channel
-	consumerTag      string
-	consumerSequence uint64
-	mutex         sync.Mutex
-	consumerMutex sync.Mutex
-	closed        bool
-	consuming     bool
+	queueName          string
+	connection         *amqp.Connection
+	publisher          *amqp.Channel
+	consumer           *amqp.Channel
+	consumerTag        string
+	consumerSequence   uint64
+	mutex              sync.Mutex
+	consumerMutex      sync.Mutex
+	closed             bool
+	consuming          bool
+	stopping           bool
+	stopRequested      chan struct{}
+	consumptionDone    chan struct{}
+	stopError          error
+	consumerCloseError error
+	closeDone          chan struct{}
 }
 
 func newQueueMiddleware(queueName string, connectionSettings m.ConnSettings) (m.Middleware, error) {
@@ -51,7 +57,14 @@ func (queue *QueueMiddleware) connect(connectionSettings m.ConnSettings) error {
 		return m.ErrMessageMiddlewareMessage
 	}
 
-	_, err = publisher.QueueDeclare(queue.queueName, true, false, false, false, nil)
+	_, err = publisher.QueueDeclare(
+		queue.queueName,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
 	if err != nil {
 		_ = publisher.Close()
 		_ = connection.Close()
@@ -63,14 +76,21 @@ func (queue *QueueMiddleware) connect(connectionSettings m.ConnSettings) error {
 	return nil
 }
 
-func (queue *QueueMiddleware) StartConsuming(callback func(m.Message, func(), func())) error {
+func (queue *QueueMiddleware) StartConsuming(
+	callback func(m.Message, func(), func()),
+) (result error) {
 	consumer, deliveries, err := queue.startConsumer()
 	if err != nil {
 		return err
 	}
-	defer queue.releaseConsumer(consumer)
 
-	return queue.consumeDeliveries(deliveries, callback)
+	defer func() {
+		if err := queue.releaseConsumer(consumer); result == nil && err != nil {
+			result = err
+		}
+	}()
+
+	return queue.consumeDeliveries(consumer, deliveries, callback)
 }
 
 func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delivery, error) {
@@ -80,6 +100,7 @@ func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delive
 	if queue.closed || queue.connection.IsClosed() {
 		return nil, nil, m.ErrMessageMiddlewareDisconnected
 	}
+
 	if queue.consuming {
 		return nil, nil, m.ErrMessageMiddlewareMessage
 	}
@@ -91,7 +112,16 @@ func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delive
 
 	queue.consumerSequence++
 	consumerTag := fmt.Sprintf("consumer-%d", queue.consumerSequence)
-	deliveries, err := consumer.Consume(queue.queueName, consumerTag, false, false, false, false, nil)
+
+	deliveries, err := consumer.Consume(
+		queue.queueName,
+		consumerTag,
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
 	if err != nil {
 		_ = consumer.Close()
 		return nil, nil, queue.consumptionError()
@@ -100,39 +130,82 @@ func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delive
 	queue.consumer = consumer
 	queue.consumerTag = consumerTag
 	queue.consuming = true
+	queue.stopping = false
+	queue.stopRequested = make(chan struct{})
+	queue.consumptionDone = make(chan struct{})
+	queue.stopError = nil
+	queue.consumerCloseError = nil
+
 	return consumer, deliveries, nil
 }
 
-func (queue *QueueMiddleware) releaseConsumer(consumer *amqp.Channel) {
-	queue.consumerMutex.Lock()
-	_ = consumer.Close()
-	queue.consumerMutex.Unlock()
-
+func (queue *QueueMiddleware) releaseConsumer(consumer *amqp.Channel) error {
 	queue.mutex.Lock()
 	defer queue.mutex.Unlock()
+
+	queue.consumerMutex.Lock()
+	if !consumer.IsClosed() {
+		queue.consumerCloseError = consumer.Close()
+	}
+	queue.consumerMutex.Unlock()
+
 	if queue.consumer == consumer {
 		queue.consumer = nil
 		queue.consumerTag = ""
 		queue.consuming = false
+		close(queue.consumptionDone)
 	}
+
+	if queue.consumerCloseError != nil {
+		return queue.consumptionError()
+	}
+
+	return nil
 }
 
 func (queue *QueueMiddleware) consumeDeliveries(
+	consumer *amqp.Channel,
 	deliveries <-chan amqp.Delivery,
 	callback func(m.Message, func(), func()),
 ) error {
 	consumerErrors := make(chan error, 1)
+
+	queue.consumerMutex.Lock()
+	consumerClosed := consumer.NotifyClose(make(chan *amqp.Error, 1))
+	queue.consumerMutex.Unlock()
+
+	queue.mutex.Lock()
+	stopRequested := queue.stopRequested
+	queue.mutex.Unlock()
+
 	for {
+		if stopped, err := queue.consumptionStatus(); stopped {
+			return err
+		}
+
 		select {
+		case <-stopRequested:
+			_, err := queue.consumptionStatus()
+			return err
+
+		case <-consumerClosed:
+			return queue.consumptionError()
+
 		case <-consumerErrors:
 			return queue.consumptionError()
+
 		case delivery, ok := <-deliveries:
+			if stopped, err := queue.consumptionStatus(); stopped {
+				return err
+			}
+
 			if !ok {
 				return queue.consumptionError()
 			}
 
 			queue.handleDelivery(delivery, callback, consumerErrors)
-			//select por si llega un mensaje nuevo y aparte el callback falló
+
+			// select por si llega un mensaje nuevo y aparte el callback falló
 			select {
 			case <-consumerErrors:
 				return queue.consumptionError()
@@ -142,23 +215,41 @@ func (queue *QueueMiddleware) consumeDeliveries(
 	}
 }
 
+func (queue *QueueMiddleware) consumptionStatus() (bool, error) {
+	queue.mutex.Lock()
+	defer queue.mutex.Unlock()
+
+	if queue.connection.IsClosed() {
+		return true, m.ErrMessageMiddlewareDisconnected
+	}
+
+	if queue.stopping {
+		return true, queue.stopError
+	}
+
+	return false, nil
+}
+
 func (queue *QueueMiddleware) handleDelivery(
 	delivery amqp.Delivery,
 	callback func(m.Message, func(), func()),
 	consumerErrors chan<- error,
 ) {
 	var resolution sync.Once
+
 	resolve := func(ack bool) {
 		resolution.Do(func() { // por si usan mal el middleware y llaman a los callbacks más de una vez
 			queue.consumerMutex.Lock()
+
 			var err error
 			if ack {
 				err = delivery.Ack(false)
 			} else {
 				err = delivery.Nack(false, true)
 			}
+
 			queue.consumerMutex.Unlock()
-		
+
 			if err != nil {
 				select {
 				case consumerErrors <- err:
@@ -179,6 +270,7 @@ func (queue *QueueMiddleware) consumptionError() error {
 	if queue.connection.IsClosed() {
 		return m.ErrMessageMiddlewareDisconnected
 	}
+
 	return m.ErrMessageMiddlewareMessage
 }
 
@@ -189,7 +281,36 @@ func (queue *QueueMiddleware) StopConsuming() error {
 	if queue.closed {
 		return m.ErrMessageMiddlewareDisconnected
 	}
-	return nil
+
+	if queue.connection.IsClosed() {
+		return m.ErrMessageMiddlewareDisconnected
+	}
+
+	return queue.cancelConsumer()
+}
+
+func (queue *QueueMiddleware) cancelConsumer() error {
+	if !queue.consuming {
+		return nil
+	}
+
+	if queue.stopping {
+		return queue.stopError
+	}
+
+	queue.stopping = true
+
+	queue.consumerMutex.Lock()
+	err := queue.consumer.Cancel(queue.consumerTag, false)
+	queue.consumerMutex.Unlock()
+
+	if err != nil {
+		queue.stopError = queue.consumptionError()
+	}
+
+	close(queue.stopRequested)
+
+	return queue.stopError
 }
 
 func (queue *QueueMiddleware) Send(message m.Message) error {
@@ -205,12 +326,15 @@ func (queue *QueueMiddleware) Send(message m.Message) error {
 		queue.queueName,
 		false,
 		false,
-		amqp.Publishing{Body: []byte(message.Body)},
+		amqp.Publishing{
+			Body: []byte(message.Body),
+		},
 	)
 	if err != nil {
 		if queue.connection.IsClosed() {
 			return m.ErrMessageMiddlewareDisconnected
 		}
+
 		return m.ErrMessageMiddlewareMessage
 	}
 
@@ -219,17 +343,38 @@ func (queue *QueueMiddleware) Send(message m.Message) error {
 
 func (queue *QueueMiddleware) Close() error {
 	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
 
 	if queue.closed {
+		done := queue.closeDone
+		queue.mutex.Unlock()
+		<-done
 		return nil
 	}
-	queue.closed = true
 
-	var closeFailed bool
+	queue.closed = true
+	queue.closeDone = make(chan struct{})
+
+	closeFailed := queue.cancelConsumer() != nil
+	done := queue.consumptionDone
+
+	queue.mutex.Unlock()
+
+	if done != nil {
+		<-done
+	}
+
+	queue.mutex.Lock()
+	defer queue.mutex.Unlock()
+	defer close(queue.closeDone)
+
+	if queue.consumerCloseError != nil {
+		closeFailed = true
+	}
+
 	if queue.publisher != nil && queue.publisher.Close() != nil {
 		closeFailed = true
 	}
+
 	if queue.connection != nil && queue.connection.Close() != nil {
 		closeFailed = true
 	}
@@ -237,5 +382,6 @@ func (queue *QueueMiddleware) Close() error {
 	if closeFailed {
 		return m.ErrMessageMiddlewareClose
 	}
+
 	return nil
 }
