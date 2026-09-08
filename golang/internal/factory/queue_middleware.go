@@ -15,11 +15,12 @@ type QueueMiddleware struct {
 	consumer           *amqp.Channel
 	consumerTag        string
 	consumerSequence   uint64
-	mutex              sync.Mutex
+	lifecycleMutex     sync.Mutex
 	consumerMutex      sync.Mutex
 	closed             bool
 	consuming          bool
 	stopping           bool
+	releasing          bool
 	stopRequested      chan struct{}
 	consumptionDone    chan struct{}
 	stopError          error
@@ -94,8 +95,8 @@ func (queue *QueueMiddleware) StartConsuming(
 }
 
 func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delivery, error) {
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
+	queue.lifecycleMutex.Lock()
+	defer queue.lifecycleMutex.Unlock()
 
 	if queue.closed || queue.connection.IsClosed() {
 		return nil, nil, m.ErrMessageMiddlewareDisconnected
@@ -131,6 +132,7 @@ func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delive
 	queue.consumerTag = consumerTag
 	queue.consuming = true
 	queue.stopping = false
+	queue.releasing = false
 	queue.stopRequested = make(chan struct{})
 	queue.consumptionDone = make(chan struct{})
 	queue.stopError = nil
@@ -140,21 +142,29 @@ func (queue *QueueMiddleware) startConsumer() (*amqp.Channel, <-chan amqp.Delive
 }
 
 func (queue *QueueMiddleware) releaseConsumer(consumer *amqp.Channel) error {
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
+	queue.lifecycleMutex.Lock()
+	if queue.consumer != consumer {
+		queue.lifecycleMutex.Unlock()
+		return nil
+	}
+	queue.releasing = true
+	queue.lifecycleMutex.Unlock()
 
 	queue.consumerMutex.Lock()
+	var closeError error
 	if !consumer.IsClosed() {
-		queue.consumerCloseError = consumer.Close()
+		closeError = consumer.Close()
 	}
 	queue.consumerMutex.Unlock()
 
-	if queue.consumer == consumer {
-		queue.consumer = nil
-		queue.consumerTag = ""
-		queue.consuming = false
-		close(queue.consumptionDone)
-	}
+	queue.lifecycleMutex.Lock()
+	defer queue.lifecycleMutex.Unlock()
+	queue.consumerCloseError = closeError
+	queue.consumer = nil
+	queue.consumerTag = ""
+	queue.consuming = false
+	queue.releasing = false
+	close(queue.consumptionDone)
 
 	if queue.consumerCloseError != nil {
 		return queue.consumptionError()
@@ -174,9 +184,9 @@ func (queue *QueueMiddleware) consumeDeliveries(
 	consumerClosed := consumer.NotifyClose(make(chan *amqp.Error, 1))
 	queue.consumerMutex.Unlock()
 
-	queue.mutex.Lock()
+	queue.lifecycleMutex.Lock()
 	stopRequested := queue.stopRequested
-	queue.mutex.Unlock()
+	queue.lifecycleMutex.Unlock()
 
 	for {
 		if stopped, err := queue.consumptionStatus(); stopped {
@@ -216,8 +226,8 @@ func (queue *QueueMiddleware) consumeDeliveries(
 }
 
 func (queue *QueueMiddleware) consumptionStatus() (bool, error) {
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
+	queue.lifecycleMutex.Lock()
+	defer queue.lifecycleMutex.Unlock()
 
 	if queue.connection.IsClosed() {
 		return true, m.ErrMessageMiddlewareDisconnected
@@ -275,8 +285,8 @@ func (queue *QueueMiddleware) consumptionError() error {
 }
 
 func (queue *QueueMiddleware) StopConsuming() error {
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
+	queue.lifecycleMutex.Lock()
+	defer queue.lifecycleMutex.Unlock()
 
 	if queue.closed {
 		return m.ErrMessageMiddlewareDisconnected
@@ -294,7 +304,7 @@ func (queue *QueueMiddleware) cancelConsumer() error {
 		return nil
 	}
 
-	if queue.stopping {
+	if queue.stopping || queue.releasing {
 		return queue.stopError
 	}
 
@@ -314,8 +324,8 @@ func (queue *QueueMiddleware) cancelConsumer() error {
 }
 
 func (queue *QueueMiddleware) Send(message m.Message) error {
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
+	queue.lifecycleMutex.Lock()
+	defer queue.lifecycleMutex.Unlock()
 
 	if queue.closed || queue.connection.IsClosed() {
 		return m.ErrMessageMiddlewareDisconnected
@@ -342,11 +352,11 @@ func (queue *QueueMiddleware) Send(message m.Message) error {
 }
 
 func (queue *QueueMiddleware) Close() error {
-	queue.mutex.Lock()
+	queue.lifecycleMutex.Lock()
 
 	if queue.closed {
 		done := queue.closeDone
-		queue.mutex.Unlock()
+		queue.lifecycleMutex.Unlock()
 		<-done
 		return nil
 	}
@@ -357,14 +367,14 @@ func (queue *QueueMiddleware) Close() error {
 	closeFailed := queue.cancelConsumer() != nil
 	done := queue.consumptionDone
 
-	queue.mutex.Unlock()
+	queue.lifecycleMutex.Unlock()
 
 	if done != nil {
 		<-done
 	}
 
-	queue.mutex.Lock()
-	defer queue.mutex.Unlock()
+	queue.lifecycleMutex.Lock()
+	defer queue.lifecycleMutex.Unlock()
 	defer close(queue.closeDone)
 
 	if queue.consumerCloseError != nil {
