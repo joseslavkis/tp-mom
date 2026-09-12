@@ -17,9 +17,7 @@ type ExchangeMiddleware struct {
 	lifecycleMutex     sync.Mutex
 	consumerMutex      sync.Mutex
 	closed             bool
-	consuming          bool
 	stopping           bool
-	releasing          bool
 	consumer           *exchangeConsumption
 	consumerSequence   uint64
 	consumerCloseError error
@@ -112,7 +110,7 @@ func (exchange *ExchangeMiddleware) startConsumer() (*exchangeConsumption, <-cha
 	if exchange.closed || exchange.connection.IsClosed() {
 		return nil, nil, m.ErrMessageMiddlewareDisconnected
 	}
-	if exchange.consuming {
+	if exchange.consumer != nil {
 		return nil, nil, m.ErrMessageMiddlewareMessage
 	}
 
@@ -149,9 +147,7 @@ func (exchange *ExchangeMiddleware) startConsumer() (*exchangeConsumption, <-cha
 		done:          make(chan struct{}),
 	}
 	exchange.consumer = consumption
-	exchange.consuming = true
 	exchange.stopping = false
-	exchange.releasing = false
 	exchange.consumerCloseError = nil
 	return consumption, deliveries, nil
 }
@@ -242,10 +238,6 @@ func (exchange *ExchangeMiddleware) consumptionStatus() (bool, error) {
 }
 
 func (exchange *ExchangeMiddleware) releaseConsumer(consumption *exchangeConsumption) error {
-	exchange.lifecycleMutex.Lock()
-	exchange.releasing = true
-	exchange.lifecycleMutex.Unlock()
-
 	exchange.consumerMutex.Lock()
 	var closeError error
 	var releaseError error
@@ -271,10 +263,10 @@ func (exchange *ExchangeMiddleware) releaseConsumer(consumption *exchangeConsump
 		releaseError = m.ErrMessageMiddlewareDisconnected
 	}
 
-	exchange.consumerCloseError = closeError
-	exchange.consumer = nil
-	exchange.consuming = false
-	exchange.releasing = false
+	if exchange.consumer == consumption {
+		exchange.consumerCloseError = closeError
+		exchange.consumer = nil
+	}
 	close(consumption.done)
 	return releaseError
 }
@@ -290,21 +282,26 @@ func (exchange *ExchangeMiddleware) StopConsuming() error {
 }
 
 func (exchange *ExchangeMiddleware) cancelConsumer() error {
-	if !exchange.consuming || exchange.stopping || exchange.releasing {
+	consumption := exchange.consumer
+	if consumption == nil || exchange.stopping {
 		return nil
 	}
 	exchange.stopping = true
 
 	exchange.consumerMutex.Lock()
-	err := exchange.consumer.channel.Cancel(exchange.consumer.tag, false)
+	if consumption.released {
+		exchange.consumerMutex.Unlock()
+		return nil
+	}
+	err := consumption.channel.Cancel(consumption.tag, false)
 	exchange.consumerMutex.Unlock()
 	if err != nil {
 		mapped := exchange.messageError()
-		exchange.consumer.stopError = mapped
-		close(exchange.consumer.stopRequested)
+		consumption.stopError = mapped
+		close(consumption.stopRequested)
 		return mapped
 	}
-	close(exchange.consumer.stopRequested)
+	close(consumption.stopRequested)
 	return nil
 }
 
