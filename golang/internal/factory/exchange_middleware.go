@@ -32,30 +32,8 @@ type exchangeConsumption struct {
 	channelClosed <-chan *amqp.Error
 	stopRequested chan struct{}
 	done          chan struct{}
-	failureSignal chan struct{}
-	resultMutex   sync.Mutex
-	terminalError error
-	finalized     bool
+	stopError     error
 	released      bool
-}
-
-func (consumption *exchangeConsumption) recordFailure(err error) {
-	if err == nil {
-		return
-	}
-
-	consumption.resultMutex.Lock()
-	defer consumption.resultMutex.Unlock()
-	if consumption.finalized || consumption.terminalError == m.ErrMessageMiddlewareDisconnected {
-		return
-	}
-	if consumption.terminalError == nil || err == m.ErrMessageMiddlewareDisconnected {
-		consumption.terminalError = err
-	}
-	select {
-	case consumption.failureSignal <- struct{}{}:
-	default:
-	}
 }
 
 func newExchangeMiddleware(exchangeName string, routingKeys []string, connectionSettings m.ConnSettings) (m.Middleware, error) {
@@ -119,11 +97,12 @@ func (exchange *ExchangeMiddleware) StartConsuming(callback func(m.Message, func
 		return err
 	}
 	defer func() {
-		result = exchange.releaseConsumer(consumption)
+		if releaseError := exchange.releaseConsumer(consumption); result == nil && releaseError != nil {
+			result = releaseError
+		}
 	}()
 
-	exchange.consumeDeliveries(consumption, deliveries, callback)
-	return nil
+	return exchange.consumeDeliveries(consumption, deliveries, callback)
 }
 
 func (exchange *ExchangeMiddleware) startConsumer() (*exchangeConsumption, <-chan amqp.Delivery, error) {
@@ -168,7 +147,6 @@ func (exchange *ExchangeMiddleware) startConsumer() (*exchangeConsumption, <-cha
 		channelClosed: channel.NotifyClose(make(chan *amqp.Error, 1)),
 		stopRequested: make(chan struct{}),
 		done:          make(chan struct{}),
-		failureSignal: make(chan struct{}, 1),
 	}
 	exchange.consumer = consumption
 	exchange.consuming = true
@@ -182,36 +160,32 @@ func (exchange *ExchangeMiddleware) consumeDeliveries(
 	consumption *exchangeConsumption,
 	deliveries <-chan amqp.Delivery,
 	callback func(m.Message, func(), func()),
-) {
+) error {
+	consumerErrors := make(chan error, 1)
 	for {
 		if stopped, err := exchange.consumptionStatus(); stopped {
-			consumption.recordFailure(err)
-			return
+			return err
 		}
 
 		select {
 		case <-consumption.stopRequested:
 			_, err := exchange.consumptionStatus()
-			consumption.recordFailure(err)
-			return
+			return err
 		case <-consumption.channelClosed:
-			consumption.recordFailure(exchange.messageError())
-			return
-		case <-consumption.failureSignal:
-			return
+			return exchange.messageError()
+		case err := <-consumerErrors:
+			return err
 		case delivery, ok := <-deliveries:
 			if stopped, err := exchange.consumptionStatus(); stopped {
-				consumption.recordFailure(err)
-				return
+				return err
 			}
 			if !ok {
-				consumption.recordFailure(exchange.messageError())
-				return
+				return exchange.messageError()
 			}
-			exchange.handleDelivery(consumption, delivery, callback)
+			exchange.handleDelivery(consumption, delivery, callback, consumerErrors)
 			select {
-			case <-consumption.failureSignal:
-				return
+			case err := <-consumerErrors:
+				return err
 			default:
 			}
 		}
@@ -222,6 +196,7 @@ func (exchange *ExchangeMiddleware) handleDelivery(
 	consumption *exchangeConsumption,
 	delivery amqp.Delivery,
 	callback func(m.Message, func(), func()),
+	consumerErrors chan<- error,
 ) {
 	var resolution sync.Once
 	resolve := func(ack bool) {
@@ -239,7 +214,10 @@ func (exchange *ExchangeMiddleware) handleDelivery(
 				err = delivery.Nack(false, true)
 			}
 			if err != nil {
-				consumption.recordFailure(exchange.messageError())
+				select {
+				case consumerErrors <- exchange.messageError():
+				default:
+				}
 			}
 		})
 	}
@@ -258,7 +236,7 @@ func (exchange *ExchangeMiddleware) consumptionStatus() (bool, error) {
 		return true, m.ErrMessageMiddlewareDisconnected
 	}
 	if exchange.stopping {
-		return true, nil
+		return true, exchange.consumer.stopError
 	}
 	return false, nil
 }
@@ -270,17 +248,18 @@ func (exchange *ExchangeMiddleware) releaseConsumer(consumption *exchangeConsump
 
 	exchange.consumerMutex.Lock()
 	var closeError error
+	var releaseError error
 	select {
 	case <-consumption.channelClosed:
-		consumption.recordFailure(exchange.messageError())
+		releaseError = exchange.messageError()
 	default:
 	}
 	if consumption.channel.IsClosed() {
-		consumption.recordFailure(exchange.messageError())
+		releaseError = exchange.messageError()
 	} else {
 		closeError = consumption.channel.Close()
 		if closeError != nil {
-			consumption.recordFailure(exchange.messageError())
+			releaseError = exchange.messageError()
 		}
 	}
 	consumption.released = true
@@ -289,19 +268,15 @@ func (exchange *ExchangeMiddleware) releaseConsumer(consumption *exchangeConsump
 	exchange.lifecycleMutex.Lock()
 	defer exchange.lifecycleMutex.Unlock()
 	if exchange.connection.IsClosed() {
-		consumption.recordFailure(m.ErrMessageMiddlewareDisconnected)
+		releaseError = m.ErrMessageMiddlewareDisconnected
 	}
-	consumption.resultMutex.Lock()
-	consumption.finalized = true
-	result := consumption.terminalError
-	consumption.resultMutex.Unlock()
 
 	exchange.consumerCloseError = closeError
 	exchange.consumer = nil
 	exchange.consuming = false
 	exchange.releasing = false
 	close(consumption.done)
-	return result
+	return releaseError
 }
 
 func (exchange *ExchangeMiddleware) StopConsuming() error {
@@ -325,7 +300,7 @@ func (exchange *ExchangeMiddleware) cancelConsumer() error {
 	exchange.consumerMutex.Unlock()
 	if err != nil {
 		mapped := exchange.messageError()
-		exchange.consumer.recordFailure(mapped)
+		exchange.consumer.stopError = mapped
 		close(exchange.consumer.stopRequested)
 		return mapped
 	}
