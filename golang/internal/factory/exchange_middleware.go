@@ -236,15 +236,11 @@ func (exchange *ExchangeMiddleware) consumptionStatus(consumption *exchangeConsu
 
 func (exchange *ExchangeMiddleware) releaseConsumer(consumption *exchangeConsumption) error {
 	exchange.consumerMutex.Lock()
-	var closeError error
 	var releaseError error
 	if consumption.channel.IsClosed() {
 		releaseError = exchange.messageError()
-	} else {
-		closeError = consumption.channel.Close()
-		if closeError != nil {
-			releaseError = exchange.messageError()
-		}
+	} else if err := consumption.channel.Close(); err != nil {
+		releaseError = exchange.messageError()
 	}
 	consumption.released = true
 	exchange.consumerMutex.Unlock()
@@ -255,7 +251,7 @@ func (exchange *ExchangeMiddleware) releaseConsumer(consumption *exchangeConsump
 		releaseError = m.ErrMessageMiddlewareDisconnected
 	}
 
-	consumption.releaseError = closeError
+	consumption.releaseError = releaseError
 	if exchange.consumer == consumption {
 		exchange.consumer = nil
 	}
