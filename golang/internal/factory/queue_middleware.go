@@ -54,7 +54,11 @@ func (queue *QueueMiddleware) connect(connectionSettings m.ConnSettings) error {
 
 	publisher, err := connection.Channel()
 	if err != nil {
+		disconnected := connection.IsClosed()
 		_ = connection.Close()
+		if disconnected {
+			return m.ErrMessageMiddlewareDisconnected
+		}
 		return m.ErrMessageMiddlewareMessage
 	}
 
@@ -67,8 +71,12 @@ func (queue *QueueMiddleware) connect(connectionSettings m.ConnSettings) error {
 		nil,
 	)
 	if err != nil {
+		disconnected := connection.IsClosed()
 		_ = publisher.Close()
 		_ = connection.Close()
+		if disconnected {
+			return m.ErrMessageMiddlewareDisconnected
+		}
 		return m.ErrMessageMiddlewareMessage
 	}
 
@@ -80,6 +88,10 @@ func (queue *QueueMiddleware) connect(connectionSettings m.ConnSettings) error {
 func (queue *QueueMiddleware) StartConsuming(
 	callback func(m.Message, func(), func()),
 ) (result error) {
+	if callback == nil {
+		return m.ErrMessageMiddlewareMessage
+	}
+
 	consumer, deliveries, err := queue.startConsumer()
 	if err != nil {
 		return err
@@ -151,26 +163,24 @@ func (queue *QueueMiddleware) releaseConsumer(consumer *amqp.Channel) error {
 	queue.lifecycleMutex.Unlock()
 
 	queue.consumerMutex.Lock()
-	var closeError error
-	if !consumer.IsClosed() {
-		closeError = consumer.Close()
+	var releaseError error
+	if consumer.IsClosed() {
+		releaseError = queue.consumptionError()
+	} else if err := consumer.Close(); err != nil {
+		releaseError = queue.consumptionError()
 	}
 	queue.consumerMutex.Unlock()
 
 	queue.lifecycleMutex.Lock()
 	defer queue.lifecycleMutex.Unlock()
-	queue.consumerCloseError = closeError
+	queue.consumerCloseError = releaseError
 	queue.consumer = nil
 	queue.consumerTag = ""
 	queue.consuming = false
 	queue.releasing = false
 	close(queue.consumptionDone)
 
-	if queue.consumerCloseError != nil {
-		return queue.consumptionError()
-	}
-
-	return nil
+	return releaseError
 }
 
 func (queue *QueueMiddleware) consumeDeliveries(

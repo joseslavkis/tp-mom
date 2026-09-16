@@ -153,7 +153,9 @@ func (exchange *ExchangeMiddleware) consumeDeliveries(
 	deliveries <-chan amqp.Delivery,
 	callback func(m.Message, func(), func()),
 ) error {
+	exchange.consumerMutex.Lock()
 	consumerClosed := consumption.channel.NotifyClose(make(chan *amqp.Error, 1))
+	exchange.consumerMutex.Unlock()
 	consumerErrors := make(chan error, 1)
 	for {
 		if stopped, err := exchange.consumptionStatus(consumption); stopped {
